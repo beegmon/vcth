@@ -1,0 +1,310 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  ports:
+    - port: 9090
+      targetPort: 9090
+  selector:
+    app: prometheus
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - extensions
+    resources:
+      - ingresses
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      scrape_timeout: 10s
+    scrape_configs:
+      - job_name: 'kubernetes-cadvisor'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+      - job_name: 'geth'
+        metrics_path: /debug/metrics/prometheus
+        static_configs:
+          - targets: ['geth-0.geth.web3.svc.cluster.local:6060']
+      - job_name: 'prysm'
+        static_configs:
+          - targets: ['prysm-0.prysm.web3.svc.cluster.local:8080']
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - name: grafana-provisioning
+              mountPath: /etc/grafana/provisioning/dashboards/dashboard-provider.yml
+              subPath: dashboard-provider.yml
+            - name: grafana-provisioning
+              mountPath: /etc/grafana/provisioning/datasources/datasources.yml
+              subPath: datasources.yml
+            - name: grafana-dashboards
+              mountPath: /var/lib/grafana/dashboards
+      volumes:
+        - name: grafana-provisioning
+          configMap:
+            name: grafana-provisioning
+        - name: grafana-dashboards
+          configMap:
+            name: grafana-dashboards
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  type: NodePort
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30000
+  selector:
+    app: grafana
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: monitoring
+data:
+  dashboard-provider.yml: |
+    apiVersion: 1
+    providers:
+    - name: 'default'
+      orgId: 1
+      folder: ''
+      type: file
+      disableDeletion: false
+      editable: true
+      options:
+        path: /var/lib/grafana/dashboards
+  datasources.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: monitoring
+data:
+  eth-node.json: |
+    {
+      "id": null,
+      "title": "Ethereum Node Status",
+      "tags": [ "geth", "prysm" ],
+      "timezone": "browser",
+      "panels": [
+        {
+          "title": "Geth Synced?",
+          "type": "stat",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "chain_head_block > bool 0", "legendFormat": "Geth" }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "No (Snapping)", "color": "orange" }, "1": { "text": "Yes", "color": "green" } } }
+              ],
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null }, { "color": "green", "value": 1 } ] }
+            }
+          },
+          "gridPos": { "h": 6, "w": 4, "x": 0, "y": 0 }
+        },
+        {
+          "title": "Prysm Synced?",
+          "type": "stat",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "beacon_head_slot / beacon_clock_time_slot", "legendFormat": "Prysm" }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "type": "range", "options": { "from": 0, "to": 0.999, "result": { "text": "No (Catching Up)", "color": "orange" } } },
+                { "type": "range", "options": { "from": 0.999, "to": 1, "result": { "text": "Yes", "color": "green" } } }
+              ],
+              "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null }, { "color": "green", "value": 0.999 } ] }
+            }
+          },
+          "gridPos": { "h": 6, "w": 4, "x": 4, "y": 0 }
+        },
+        {
+          "title": "Peer Count",
+          "type": "stat",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "p2p_peers", "legendFormat": "Geth Peers" },
+            { "expr": "p2p_peer_count{state='Connected'}", "legendFormat": "Prysm Peers" }
+          ],
+          "gridPos": { "h": 6, "w": 8, "x": 8, "y": 0 }
+        },
+        {
+          "title": "Block Height",
+          "type": "graph",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "chain_head_block", "legendFormat": "Geth Block (Left)" },
+            { "expr": "beacon_head_slot", "legendFormat": "Prysm Slot (Right)" }
+          ],
+          "seriesOverrides": [
+            { "alias": "Prysm Slot (Right)", "yaxis": 2 }
+          ],
+          "yaxes": [
+            { "format": "none", "label": "Geth", "show": true, "logBase": 1, "min": 0 },
+            { "format": "none", "label": "Prysm", "show": true, "logBase": 1 }
+          ],
+           "gridPos": { "h": 8, "w": 24, "x": 0, "y": 6 }
+        },
+        {
+          "title": "Memory Usage",
+          "type": "graph",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "sum by (pod) (container_memory_usage_bytes{pod=~'geth-0|prysm-0'})", "legendFormat": "{{pod}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "decbytes" } },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 }
+        },
+        {
+          "title": "CPU Usage",
+          "type": "graph",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{pod=~'geth-0|prysm-0'}[1m]))", "legendFormat": "{{pod}}" }
+          ],
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 }
+        },
+        {
+          "title": "Disk IO (Reads/Writes)",
+          "type": "graph",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "sum by (pod) (rate(container_fs_reads_bytes_total{pod=~'geth-0|prysm-0'}[1m]))", "legendFormat": "{{pod}} Reads" },
+            { "expr": "sum by (pod) (rate(container_fs_writes_bytes_total{pod=~'geth-0|prysm-0'}[1m]))", "legendFormat": "{{pod}} Writes" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "Bps" } },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 }
+        },
+        {
+          "title": "Geth Snap Sync Activity (State/sec)",
+          "type": "graph",
+          "datasource": "Prometheus",
+          "targets": [
+            { "expr": "rate(eth_protocols_snap_sync_storage_small[1m]) + rate(eth_protocols_snap_sync_account_lookup_inner[1m])", "legendFormat": "State Objects Downloaded" }
+          ],
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 }
+        }
+      ],
+      "schemaVersion": 16
+    }

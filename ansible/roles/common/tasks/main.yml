@@ -1,0 +1,26 @@
+---
+- name: Update apt cache
+  apt:
+    update_cache: yes
+
+- name: Install dependencies
+  apt:
+    name:
+      - curl
+      - gnupg
+      - iptables
+      - ufw
+      - chrony     # Critical for Blockchain Block Timestamps
+      - fail2ban   # SSH Brute Force Protection
+      - nvme-cli   # Storage Management
+      - iotop      # I/O Monitoring
+      - htop       # Resource Monitoring
+      - jq         # JSON Processor
+      - bridge-utils
+    state: present
+
+- name: Enable Time Sync (NTP)
+  service:
+    name: chrony
+    state: started
+    enabled: yes
