@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prysm
+  namespace: web3
+spec:
+  serviceName: "prysm"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prysm
+  template:
+    metadata:
+      labels:
+        app: prysm
+    spec:
+      initContainers:
+        - name: build-healthcheck
+          image: golang:1.22-alpine
+          command: ["env", "CGO_ENABLED=0", "go", "build", "-o", "/bin-shared/healthcheck", "/src/healthcheck.go"]
+          volumeMounts:
+            - name: script-source
+              mountPath: /src
+            - name: bin-shared
+              mountPath: /bin-shared
+      containers:
+        - name: beacon
+          image: gcr.io/prysmaticlabs/prysm/beacon-chain:stable
+          args:
+            - --sepolia
+            - --execution-endpoint=http://geth-0.geth.web3.svc.cluster.local:8551
+            - --jwt-secret=/data/jwt-dir/jwt
+            - --accept-terms-of-use
+            - --checkpoint-sync-url=https://sepolia.beaconstate.info
+            - --genesis-beacon-api-url=https://sepolia.beaconstate.info
+            - --datadir=/data
+            - --rpc-host=0.0.0.0
+            - --grpc-gateway-host=0.0.0.0
+            - --monitoring-host=0.0.0.0
+            - --monitoring-port=8080
+            # Production P2P Tuning
+            - --p2p-max-peers=100
+          ports:
+            - containerPort: 3500
+              name: http
+            - containerPort: 8080
+              name: metrics
+            - containerPort: 4000
+              name: grpc
+            - containerPort: 12000
+              name: p2p-udp
+              protocol: UDP
+            - containerPort: 13000
+              name: p2p-tcp
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: jwt-secret
+              mountPath: /data/jwt-dir
+              readOnly: true
+            - name: bin-shared
+              mountPath: /bin-shared
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          # Authoritative Go Healthchecks (Static Binary)
+          readinessProbe:
+            exec:
+              command: ["/bin-shared/healthcheck", "--component=prysm", "--check=readiness"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin-shared/healthcheck", "--component=prysm", "--check=liveness"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+      terminationGracePeriodSeconds: 60
+      volumes:
+        - name: jwt-secret
+          secret:
+            secretName: jwt-secret
+        - name: bin-shared
+          emptyDir: {}
+        - name: script-source
+          configMap:
+            name: healthcheck-script
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 20Gi

@@ -1,0 +1,377 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// --- Structs & Config ---
+
+type Config struct {
+	// Probe Mode (K8s)
+	Component string // "geth" or "prysm"
+	Check     string // "liveness" or "readiness"
+	
+	// CLI Mode (User)
+	EnableEL    bool
+	EnableCL    bool
+	ELUrl       string
+	CLUrl       string
+	AllowPending bool
+}
+
+type GethStatus struct {
+	Healthy     bool
+	IsSyncing   bool
+	BlockNumber int64
+	PeerCount   int64
+	BlockAge    int64
+	Error       error
+}
+
+type PrysmStatus struct {
+	Healthy     bool
+	IsSyncing   bool
+	PeerCount   int64 // Not always avail in simple sync check, but we can try
+	HeadSlot    int64
+	Error       error
+}
+
+// --- Main Entrypoint ---
+
+func main() {
+	// K8s Probe Flags
+	component := flag.String("component", "", "Component to check: geth or prysm (K8s Mode)")
+	check := flag.String("check", "", "Check type: liveness or readiness")
+
+	// User CLI Flags
+	el := flag.Bool("el", false, "Check Execution Layer (Geth)")
+	cl := flag.Bool("cl", false, "Check Consensus Layer (Prysm)")
+	elRpc := flag.String("el-rpc-endpoint", "http://localhost:8545", "EL RPC URL")
+	clRpc := flag.String("cl-rpc-endpoint", "http://localhost:3500", "CL RPC URL")
+
+	// Parse pending/lax flag
+	pending := flag.Bool("pending", false, "Allow SYNCING state to pass (Verification Mode)")
+	flag.Parse()
+
+	// MODE 1: K8s Probe (Single Shot, specific component)
+	if *component != "" {
+		url := "http://localhost:8545"
+		if *component == "prysm" {
+			url = "http://localhost:3500"
+		}
+		
+		err := runProbe(*component, *check, url)
+		if err != nil {
+			fmt.Printf("Probe Failed: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// MODE 2: User CLI
+	enableEL := *el
+	enableCL := *cl
+	if !enableEL && !enableCL {
+		// Default to ENV or Localhost EL
+		envURL := os.Getenv("WEB3_RPC_URL")
+		if envURL != "" {
+			enableEL = true
+			*elRpc = envURL
+		} else {
+			enableEL = true 
+		}
+	}
+
+	cfg := Config{
+		EnableEL: enableEL,
+		EnableCL: enableCL,
+		ELUrl:    *elRpc,
+		CLUrl:    *clRpc,
+		AllowPending: *pending,
+	}
+
+	runUserCLI(cfg)
+}
+
+// --- Logic ---
+
+// ... runProbe (Unchanged) ...
+func runProbe(component, checkType, url string) error {
+	switch component {
+	case "geth":
+		status := fetchGethStatus(url)
+		if status.Error != nil && checkType == "liveness" {
+			return status.Error // Liveness only fails on connection error
+		}
+		if checkType == "liveness" {
+			return nil // Liveness passes if connected
+		}
+
+		// Readiness logic
+		if status.Error != nil {
+			return status.Error
+		}
+		if status.IsSyncing {
+			return fmt.Errorf("node is syncing")
+		}
+		if !status.Healthy {
+			return fmt.Errorf("node is zombie/stale (age: %ds)", status.BlockAge)
+		}
+		return nil
+
+	case "prysm":
+		status := fetchPrysmStatus(url)
+		if status.Error != nil && checkType == "liveness" {
+			return status.Error
+		}
+		if checkType == "liveness" {
+			return nil 
+		}
+
+		// Readiness logic
+		if status.Error != nil {
+			return status.Error
+		}
+		if status.IsSyncing {
+			return fmt.Errorf("node is syncing")
+		}
+		return nil
+		
+	default:
+		return fmt.Errorf("unknown component: %s", component)
+	}
+}
+
+func runUserCLI(cfg Config) {
+	fmt.Println("Starting Unified Health Check Loop (Timeout: 5m)...")
+	if cfg.AllowPending {
+		fmt.Println(" [MODE] Verification: 'SYNCING' state considered PASS.")
+	}
+	if cfg.EnableEL {
+		fmt.Printf(" - Checking EL (Geth): %s\n", cfg.ELUrl)
+	}
+	if cfg.EnableCL {
+		fmt.Printf(" - Checking CL (Prysm): %s\n", cfg.CLUrl)
+	}
+	fmt.Println("----------------------------------------------------------------")
+
+	attempts := 150 // 5 minutes
+	successCount := 0
+	
+	for i := 1; i <= attempts; i++ {
+		
+		var elStatus GethStatus
+		var clStatus PrysmStatus
+		allPassed := true
+
+		// 1. Check EL
+		if cfg.EnableEL {
+			elStatus = fetchGethStatus(cfg.ELUrl)
+			statusStr := "HEALTHY"
+			if elStatus.Error != nil {
+				statusStr = fmt.Sprintf("FAIL (%v)", elStatus.Error)
+				allPassed = false
+			} else if elStatus.IsSyncing {
+				statusStr = "SYNCING"
+				if !cfg.AllowPending {
+					allPassed = false
+				}
+			} else if !elStatus.Healthy {
+				statusStr = fmt.Sprintf("ZOMBIE (Age: %ds)", elStatus.BlockAge)
+				allPassed = false
+			}
+			
+			fmt.Printf("[EL] Status: %-10s | Block: %-8d | Peers: %-4d\n", 
+				statusStr, elStatus.BlockNumber, elStatus.PeerCount)
+		}
+
+		// 2. Check CL
+		if cfg.EnableCL {
+			clStatus = fetchPrysmStatus(cfg.CLUrl)
+			statusStr := "HEALTHY"
+			if clStatus.Error != nil {
+				statusStr = fmt.Sprintf("FAIL (%v)", clStatus.Error)
+				allPassed = false
+			} else if clStatus.IsSyncing {
+				statusStr = "SYNCING"
+				if !cfg.AllowPending {
+					allPassed = false
+				}
+			}
+			
+			peerStr := "N/A"
+			if clStatus.PeerCount >= 0 {
+				peerStr = fmt.Sprintf("%d", clStatus.PeerCount)
+			}
+			
+			fmt.Printf("[CL] Status: %-10s | Slot: %-8d | Peers: %s\n", statusStr, clStatus.HeadSlot, peerStr)
+		}
+
+		if allPassed {
+			successCount++
+			if successCount >= 3 { // Require 3 consecutive successes
+				fmt.Println("\n[PASS] Health Check PASSED: Components are Ready (or Syncing Confirmed).")
+				os.Exit(0)
+			}
+		} else {
+			successCount = 0
+		}
+
+		if !allPassed {
+			// Only print dots/sleep if not passing
+			// But we already printed status above.
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	fmt.Println("\n[FAIL] Health Check FAILED: Timed out waiting for nodes.")
+	os.Exit(1)
+}
+
+// --- Fetchers ---
+
+func fetchGethStatus(url string) GethStatus {
+	s := GethStatus{}
+	
+	// 1. Check Syncing
+	payload := []byte(`{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}`)
+	resp, err := callRPC(url, payload)
+	if err != nil {
+		s.Error = err
+		return s
+	}
+	
+	var res map[string]interface{}
+	json.Unmarshal(resp, &res)
+	
+	// eth_syncing returns FALSE if synced, or an OBJECT if syncing
+	if b, ok := res["result"].(bool); ok && !b {
+		s.IsSyncing = false
+	} else {
+		s.IsSyncing = true
+	}
+
+	// 2. Metadata (Block/Peers)
+	// Block
+	blockPayload := []byte(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest", false],"id":1}`)
+	if blockResp, err := callRPC(url, blockPayload); err == nil {
+		var bRes map[string]interface{}
+		json.Unmarshal(blockResp, &bRes)
+		if bMap, ok := bRes["result"].(map[string]interface{}); ok {
+			if tStr, ok := bMap["timestamp"].(string); ok {
+				timestamp := hexToInt(tStr)
+				s.BlockAge = time.Now().Unix() - timestamp
+			}
+			if nStr, ok := bMap["number"].(string); ok {
+				s.BlockNumber = hexToInt(nStr)
+			}
+		}
+	}
+
+	// Peers
+	peerPayload := []byte(`{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}`)
+	if peerResp, err := callRPC(url, peerPayload); err == nil {
+		var pRes map[string]interface{}
+		json.Unmarshal(peerResp, &pRes)
+		if pStr, ok := pRes["result"].(string); ok {
+			s.PeerCount = hexToInt(pStr)
+		}
+	}
+
+	// 3. Health Logic
+	// If not syncing, check age
+	if !s.IsSyncing && s.BlockAge > 60 {
+		s.Healthy = false // Zombie
+	} else {
+		s.Healthy = true
+	}
+	// Note: If syncing, Healthy=true is debateable, but Readiness check handles that specific logic.
+	// For this struct, Healthy implies "Fresh and Good".
+	// Let's explicitly say: Healthy if Not Syncing AND Not Zombie.
+	if s.IsSyncing {
+		s.Healthy = false
+	}
+
+	return s
+}
+
+func fetchPrysmStatus(url string) PrysmStatus {
+	s := PrysmStatus{PeerCount: -1}
+
+	// Check Syncing: /eth/v1/node/syncing
+	resp, err := http.Get(url + "/eth/v1/node/syncing")
+	if err != nil {
+		s.Error = err
+		return s
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		s.Error = fmt.Errorf("status %d", resp.StatusCode)
+		return s
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	var res map[string]interface{}
+	json.Unmarshal(body, &res)
+	
+	if data, ok := res["data"].(map[string]interface{}); ok {
+		if isSync, ok := data["is_syncing"].(bool); ok {
+			s.IsSyncing = isSync
+		}
+		if headSlot, ok := data["head_slot"].(string); ok {
+			val, _ := strconv.ParseInt(headSlot, 10, 64)
+			s.HeadSlot = val
+		}
+	}
+
+	// Try fetching peers: /eth/v1/node/peers
+	// Prysm often returns many peers, we just want count
+	if respPeers, err := http.Get(url + "/eth/v1/node/peers"); err == nil {
+		defer respPeers.Body.Close()
+		bodyP, _ := io.ReadAll(respPeers.Body)
+		var resP map[string]interface{}
+		json.Unmarshal(bodyP, &resP)
+		if dataP, ok := resP["data"].([]interface{}); ok {
+			s.PeerCount = int64(len(dataP))
+		}
+	}
+
+	s.Healthy = !s.IsSyncing
+	return s
+}
+
+// --- Utilities ---
+
+func callRPC(url string, payload []byte) ([]byte, error) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+func hexToInt(hexStr string) int64 {
+	if len(hexStr) > 2 && strings.HasPrefix(hexStr, "0x") {
+		hexStr = hexStr[2:]
+	}
+	val, _ := strconv.ParseInt(hexStr, 16, 64)
+	return val
+}

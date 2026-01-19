@@ -1,0 +1,30 @@
+---
+# 2. Security Configuration (Simulated)
+- name: Configure Firewall (UFW)
+  ufw:
+    state: enabled
+    policy: deny
+
+- name: Allow SSH
+  ufw:
+    rule: allow
+    port: '22'
+    proto: tcp
+
+- name: Allow Geth P2P (TCP/UDP)
+  ufw:
+    rule: allow
+    port: '30303'
+    proto: any
+
+- name: Allow Prysm P2P (TCP/UDP)
+  ufw:
+    rule: allow
+    port: '13000'
+    proto: tcp
+
+- name: Allow Prysm P2P UDP
+  ufw:
+    rule: allow
+    port: '12000'
+    proto: udp

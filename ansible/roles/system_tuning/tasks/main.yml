@@ -1,0 +1,74 @@
+---
+# 1. System Tuning (Optimizing for P2P/Web3)
+# This PROVES the container is privileged. Fails otherwise.
+- name: Tune Kernel Parameters (P2P Optimization)
+  sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_set: yes
+  loop:
+    - { name: 'net.core.somaxconn', value: '32768' } # Max connection queue
+    - { name: 'net.ipv4.tcp_rmem', value: '4096 87380 33554432' } # TCP Auto-tuning limits
+    - { name: 'net.ipv4.tcp_wmem', value: '4096 65536 33554432' }
+    - { name: 'net.ipv4.tcp_congestion_control', value: 'bbr' } # BBR for superior throughput/latency
+    - { name: 'net.ipv4.tcp_slow_start_after_idle', value: '0' } # Keep connection windows open
+    - { name: 'net.ipv4.tcp_max_syn_backlog', value: '16384' }
+    - { name: 'net.ipv4.ip_local_port_range', value: '1024 65535' }
+    - { name: 'fs.file-max', value: '1000000' }
+    - { name: 'vm.max_map_count', value: '262144' } # Required for DBs (LevelDB/Pebble)
+
+# These keys (net.core.*) control the core kernel socket buffers.
+# In a Docker container (Simulation), these are strictly controlled by the HOST kernel and are read-only, even in privileged mode.
+# In a Real Bare Metal Deployment (Production), these would succeed and are critical for performance.
+# We use 'ignore_errors: yes' here to demonstrate the INTENT of the tuning without breaking the simulation.
+- name: Tune Host-Level Network Buffers (Best Effort in Docker)
+  sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_set: yes
+  loop:
+    - { name: 'net.core.rmem_max', value: '33554432' } # 32MB Read Buffer
+    - { name: 'net.core.wmem_max', value: '33554432' } # 32MB Write Buffer
+  ignore_errors: yes
+
+- name: Configure File Limits (ulimit)
+  pam_limits:
+    domain: '*'
+    limit_type: "{{ item.type }}"
+    limit_item: nofile
+    value: '1048576'
+    - { type: 'hard' }
+
+- name: Disable Swap (Kubernetes Requirement)
+  shell: |
+    swapoff -a
+    sed -i '/swap/d' /etc/fstab
+  when: ansible_swaptotal_mb > 0
+  ignore_errors: yes # In containers, this might fail or be irrelevant
+
+- name: Set CPU Governor to Performance (Bare Metal Only)
+  shell: |
+    for file in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo "performance" > $file; done
+  ignore_errors: yes # Fails in VMs/Containers often
+
+- name: Tune Journald (Prevent Log Overflow)
+  copy:
+    dest: /etc/systemd/journald.conf.d/00-tuning.conf
+    content: |
+      [Journal]
+      SystemMaxUse=1G
+      SystemKeepFree=1G
+    mode: '0644'
+  notify: Restart Journald
+
+  # Handlers would usually go in handlers/main.yml, but inline for brevity/demo
+  # or we just ignore the notify error if handler missing.
+  # Let's just create the directory first.
+- name: Create Journald Config Dir
+  file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: '0755'
+  before: "Tune Journald"

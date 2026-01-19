@@ -1,0 +1,43 @@
+Part 1 - Deploy a Web3 Node in Kubernetes (Simulating Bare Metal)
+
+(A) Simulate a bare metal deployment using a local Kubernetes cluster.
+
+Deploy an Ethereum Execution Client (Geth) and Consensus Client (Prysm or Lighthouse) on Kubernetes.
+Configure StatefulSets with Persistent Volumes to simulate the storage setup typically used on bare metal.
+Use HostPath volumes or local persistent volumes to mimic local disk storage instead of cloud-managed storage classes.
+Ensure the node starts syncing (no full sync required, just logs confirming progress).
+(B) Demonstrate how you would optimize this for a real bare metal environment.
+
+Write a short document or comments in the README explaining how you would:
+Optimize networking for P2P connections.
+Ensure data persistence across reboots.
+Configure system tuning (kernel parameters, file limits, NUMA-aware configurations).
+(C) Monitor the Web3 node using Kubernetes-native tools.
+
+Use Prometheus to scrape Ethereum node metrics from both execution and consensus clients.
+Deploy Grafana with a dashboard showing:
+Peer count
+Sync progress
+Memory & CPU usage
+Disk IO
+Part 2 - Automate Infrastructure Setup
+
+(A) Automate the Kubernetes deployment using Bash or Go.
+
+Write a script that:
+Deploys the Web3 node on Kubernetes using kubectl commands or Helm.
+Waits for the pod to become ready.
+Checks the logs to confirm syncing has started.
+(B) Write a second script (Golang) to perform health checks.
+
+The script should:
+Query the execution client’s RPC API and print the latest block height.
+Also prints the number of connected peers
+Log the results and exit with non-zero status if unhealthy.
+(C) Demonstrate how you would provision a real bare metal environment.
+
+Provide an Ansible playbook or Terraform script that simulates the setup of a bare metal machine.
+This script does not need to be run but should outline how you would:
+Install Kubernetes.
+Configure networking (firewalls, IP tables, P2P optimizations).
+Set up the necessary system dependencies for running Ethereum clients.

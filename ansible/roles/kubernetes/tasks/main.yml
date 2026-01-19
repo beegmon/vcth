@@ -1,0 +1,19 @@
+---
+# 3. Install Kubernetes Prerequisites (Usage Example for Bare Metal)
+# 3. Install Kubernetes (K3s - Lightweight & Simulated Friendly)
+- name: Install Curl (Required for K3s script)
+  apt:
+    name: curl
+    state: present
+
+- name: Install K3s (Lightweight Kubernetes)
+  shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable traefik" sh -
+  args:
+    creates: /usr/local/bin/k3s
+
+- name: Ensure K3s is started
+  service:
+    name: k3s
+    state: started
+    enabled: yes

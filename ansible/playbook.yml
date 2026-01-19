@@ -1,0 +1,17 @@
+---
+- name: Provision Bare Metal Server
+  hosts: bare_metal
+  become: no
+  gather_facts: false # Disable gathering facts initially (Python might be missing)
+  pre_tasks:
+    - name: Install Python3 (Bootstrap for Ansible)
+      raw: test -e /usr/bin/python3 || (apt-get -y update && apt-get install -y python3)
+      changed_when: false
+    - name: Gather Facts
+      setup:
+
+  roles:
+    - common
+    - system_tuning
+    - security
+    - kubernetes

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: geth
+  namespace: web3
+spec:
+  serviceName: "geth"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: geth
+  template:
+    metadata:
+      labels:
+        app: geth
+    spec:
+      initContainers:
+        - name: build-healthcheck
+          image: golang:1.22-alpine
+          command: ["go", "build", "-o", "/bin-shared/healthcheck", "/src/healthcheck.go"]
+          volumeMounts:
+            - name: script-source
+              mountPath: /src
+            - name: bin-shared
+              mountPath: /bin-shared
+      containers:
+        - name: geth
+          image: ethereum/client-go:stable
+          args:
+            - --sepolia
+            - --http
+            - --http.addr=0.0.0.0
+            - --http.vhosts=*
+            - --http.api=eth,net,engine,admin
+            - --authrpc.addr=0.0.0.0
+            - --authrpc.port=8551
+            - --authrpc.vhosts=*
+            - --authrpc.jwtsecret=/data/jwt-dir/jwt
+            - --datadir=/data
+            - --metrics
+            - --metrics.addr=0.0.0.0
+            - --metrics.port=6060
+            # Production P2P Tuning
+            - --maxpeers=100
+            - --cache=4096
+            - --txpool.globalslots=5120
+            - --txpool.globalqueue=2048
+          ports:
+            - containerPort: 8545
+              name: http
+            - containerPort: 6060
+              name: metrics
+            - containerPort: 8551
+              name: authrpc
+            - containerPort: 30303
+              name: p2p-tcp
+            - containerPort: 30303
+              protocol: UDP
+              name: p2p-udp
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: jwt-secret
+              mountPath: /data/jwt-dir
+              readOnly: true
+            - name: bin-shared
+              mountPath: /bin-shared
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          # Authoritative Go Healthchecks (Compiled in InitContainer)
+          readinessProbe:
+            exec:
+              command: ["/bin-shared/healthcheck", "--component=geth", "--check=readiness"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin-shared/healthcheck", "--component=geth", "--check=liveness"]
+            initialDelaySeconds: 60 # Give generic startup time
+            periodSeconds: 30
+            timeoutSeconds: 5
+      terminationGracePeriodSeconds: 60
+      volumes:
+        - name: jwt-secret
+          secret:
+            secretName: jwt-secret
+        - name: bin-shared
+          emptyDir: {}
+        - name: script-source
+          configMap:
+            name: healthcheck-script
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 20Gi
